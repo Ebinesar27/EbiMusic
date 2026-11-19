@@ -1,2 +1,20 @@
-[InternetShortcut]
-URL=file:///c%3A/Users/Admin/Desktop/EMusic/render.yaml
+services:
+  - type: web
+    name: newpipe-music-api
+    runtime: docker
+    plan: starter            # persistent disks need a paid plan; "free" works but loses data on redeploy
+    healthCheckPath: /health
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: CACHE_MAX_MB
+        value: "1000"
+      - key: CACHE_MAX_FILES
+        value: "100"
+      - key: YTDLP_COOKIES
+        value: /etc/secrets/cookies.txt   # optional Secret File, see README
+    disk:
+      name: music-data
+      mountPath: /data
+      sizeGB: 2
+
