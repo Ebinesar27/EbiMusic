@@ -1,6 +1,7 @@
+
 """
 Audio-only music playlist API (NewPipe-style extraction via yt-dlp).
-
+ 
 Features
   * Search songs by name            GET    /search?q=...
   * Create / list playlists         POST   /playlists, GET /playlists
@@ -8,7 +9,7 @@ Features
   * Stream audio-only MP3           GET    /audio/{video_id}
   * M3U playlist of MP3 streams     GET    /playlists/{id}/m3u
   * Tiny web player                 GET    /
-
+ 
 Requires ffmpeg on PATH (used to convert the audio stream to MP3).
 """
 import logging
@@ -16,16 +17,17 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
-
+ 
 import yt_dlp
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-
+ 
 BASE_DIR = Path(__file__).parent
 # On Render, set DATA_DIR to a persistent disk mount (e.g. /data) so playlists survive redeploys.
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
@@ -33,25 +35,36 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR = DATA_DIR / "audio_cache"
 CACHE_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "music.db"
-
+ 
 # Optional: path to a Netscape-format cookies.txt. YouTube often blocks datacenter IPs
 # (like Render's) with "Sign in to confirm you're not a bot"; cookies from a logged-in
 # browser can get past that. On Render add it as a Secret File and point this at it.
 COOKIES_FILE = os.getenv("YTDLP_COOKIES")
-
-
+ 
+ 
+def _writable_cookies() -> str | None:
+    """yt-dlp rewrites its cookie file; Render's secret files are read-only, so use a copy."""
+    if not COOKIES_FILE or not Path(COOKIES_FILE).exists():
+        return None
+    dst = Path(tempfile.gettempdir()) / "yt_cookies.txt"
+    if not dst.exists() or dst.stat().st_mtime < Path(COOKIES_FILE).stat().st_mtime:
+        shutil.copyfile(COOKIES_FILE, dst)
+    return str(dst)
+ 
+ 
 def ydl_extra() -> dict:
-    return {"cookiefile": COOKIES_FILE} if COOKIES_FILE and Path(COOKIES_FILE).exists() else {}
-
+    path = _writable_cookies()
+    return {"cookiefile": path} if path else {}
+ 
 # Cache limits: when either is exceeded, the least recently played MP3s are deleted.
 # Override without editing code, e.g. (PowerShell):  $env:CACHE_MAX_MB = "1000"
 CACHE_MAX_MB = int(os.getenv("CACHE_MAX_MB", "500"))
 CACHE_MAX_FILES = int(os.getenv("CACHE_MAX_FILES", "50"))
-
+ 
 app = FastAPI(title="NewPipe-style Music API", version="1.0.0")
 log = logging.getLogger("uvicorn.error")
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Database
 # --------------------------------------------------------------------------- #
@@ -65,8 +78,8 @@ def db():
         conn.commit()
     finally:
         conn.close()
-
-
+ 
+ 
 def init_db() -> None:
     with db() as c:
         c.executescript(
@@ -88,18 +101,18 @@ def init_db() -> None:
             );
             """
         )
-
-
+ 
+ 
 init_db()
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # YouTube helpers (yt-dlp)
 # --------------------------------------------------------------------------- #
 VIDEO_ID_RE = re.compile(r"^[\w-]{11}$")
 YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}
-
-
+ 
+ 
 def extract_video_id(url: str) -> str:
     """Pull the 11-char video id out of any YouTube 'copy link' format."""
     url = url.strip()
@@ -119,12 +132,12 @@ def extract_video_id(url: str) -> str:
     if not vid or not VIDEO_ID_RE.match(vid):
         raise HTTPException(400, "Not a valid YouTube video link")
     return vid
-
-
+ 
+ 
 def watch_url(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
-
-
+ 
+ 
 def fetch_info(video_id: str) -> dict:
     opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True, **ydl_extra()}
     try:
@@ -132,12 +145,12 @@ def fetch_info(video_id: str) -> dict:
             return ydl.extract_info(watch_url(video_id), download=False)
     except yt_dlp.utils.DownloadError as e:
         raise HTTPException(404, f"Could not fetch video: {e}") from e
-
-
+ 
+ 
 _locks: dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
-
-
+ 
+ 
 def ensure_mp3(video_id: str) -> Path:
     """Download the audio-only stream and convert it to MP3 (cached)."""
     mp3 = CACHE_DIR / f"{video_id}.mp3"
@@ -150,7 +163,7 @@ def ensure_mp3(video_id: str) -> Path:
             f"{' and '.join(missing)} not found on PATH. Install ffmpeg (it includes ffprobe) "
             "and restart the server from a NEW terminal.",
         )
-
+ 
     with _locks_guard:
         lock = _locks.setdefault(video_id, threading.Lock())
     with lock:  # avoid downloading the same song twice concurrently
@@ -176,19 +189,19 @@ def ensure_mp3(video_id: str) -> Path:
     if not mp3.exists():
         raise HTTPException(500, "MP3 conversion finished but the file was not created")
     return mp3
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Schemas
 # --------------------------------------------------------------------------- #
 class PlaylistCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-
-
+ 
+ 
 class ItemAdd(BaseModel):
     url: str = Field(description="YouTube 'copy link' URL, e.g. https://youtu.be/dQw4w9WgXcQ")
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Search
 # --------------------------------------------------------------------------- #
@@ -217,8 +230,8 @@ def search(q: str = Query(min_length=1), limit: int = Query(10, ge=1, le=25)):
             }
         )
     return {"query": q, "results": results}
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Playlists
 # --------------------------------------------------------------------------- #
@@ -230,8 +243,8 @@ def create_playlist(body: PlaylistCreate):
             return {"id": cur.lastrowid, "name": body.name.strip()}
     except sqlite3.IntegrityError:
         raise HTTPException(409, "A playlist with that name already exists")
-
-
+ 
+ 
 @app.get("/playlists")
 def list_playlists():
     with db() as c:
@@ -241,15 +254,15 @@ def list_playlists():
                GROUP BY p.id ORDER BY p.id"""
         ).fetchall()
     return [dict(r) for r in rows]
-
-
+ 
+ 
 def _get_playlist(c: sqlite3.Connection, pid: int) -> sqlite3.Row:
     row = c.execute("SELECT * FROM playlists WHERE id = ?", (pid,)).fetchone()
     if not row:
         raise HTTPException(404, "Playlist not found")
     return row
-
-
+ 
+ 
 @app.get("/playlists/{pid}")
 def get_playlist(pid: int, request: Request):
     base = str(request.base_url).rstrip("/")
@@ -260,15 +273,15 @@ def get_playlist(pid: int, request: Request):
         ).fetchall()
     items = [{**dict(r), "audio_url": f"{base}/audio/{r['video_id']}"} for r in rows]
     return {"id": pl["id"], "name": pl["name"], "items": items}
-
-
+ 
+ 
 @app.delete("/playlists/{pid}", status_code=204)
 def delete_playlist(pid: int):
     with db() as c:
         _get_playlist(c, pid)
         c.execute("DELETE FROM playlists WHERE id = ?", (pid,))
-
-
+ 
+ 
 @app.post("/playlists/{pid}/items", status_code=201)
 def add_item(pid: int, body: ItemAdd):
     """Add a song to a playlist using a YouTube 'copy link' URL."""
@@ -298,16 +311,16 @@ def add_item(pid: int, body: ItemAdd):
         except sqlite3.IntegrityError:
             raise HTTPException(409, "Song is already in this playlist")
     return {"item_id": cur.lastrowid, "video_id": video_id, "title": info.get("title"), "position": pos}
-
-
+ 
+ 
 @app.delete("/playlists/{pid}/items/{item_id}", status_code=204)
 def remove_item(pid: int, item_id: int):
     with db() as c:
         cur = c.execute("DELETE FROM items WHERE id = ? AND playlist_id = ?", (item_id, pid))
         if cur.rowcount == 0:
             raise HTTPException(404, "Item not found")
-
-
+ 
+ 
 @app.get("/playlists/{pid}/m3u", response_class=PlainTextResponse)
 def playlist_m3u(pid: int, request: Request):
     """M3U file - open it in VLC or any audio player to play the whole playlist."""
@@ -322,17 +335,17 @@ def playlist_m3u(pid: int, request: Request):
         lines.append(f"#EXTINF:{r['duration'] or -1},{r['title']}")
         lines.append(f"{base}/audio/{r['video_id']}")
     return PlainTextResponse("\n".join(lines) + "\n", media_type="audio/x-mpegurl")
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Audio streaming (MP3 only)
 # --------------------------------------------------------------------------- #
 _prune_lock = threading.Lock()
-
-
+ 
+ 
 def prune_cache(keep=None) -> None:
     """Delete least-recently-played MP3s until the cache is within its limits.
-
+ 
     `keep` is a file that must never be deleted (the one being played right now).
     Recency is tracked through file modification time, which stream_audio refreshes
     on every play.
@@ -346,11 +359,11 @@ def prune_cache(keep=None) -> None:
                 continue
             entries.append((st.st_mtime, st.st_size, p))
         entries.sort(key=lambda e: e[0])  # oldest first
-
+ 
         total = sum(e[1] for e in entries)
         count = len(entries)
         max_bytes = CACHE_MAX_MB * 1024 * 1024
-
+ 
         for _, size, p in entries:
             if count <= CACHE_MAX_FILES and total <= max_bytes:
                 break
@@ -363,11 +376,11 @@ def prune_cache(keep=None) -> None:
             total -= size
             count -= 1
             log.info("Cache cleanup: removed %s", p.name)
-
-
+ 
+ 
 prune_cache()  # also tidy up at startup
-
-
+ 
+ 
 @app.get("/audio/{video_id}")
 def stream_audio(video_id: str):
     """Returns the audio-only MP3 (first request downloads + converts, then cached)."""
@@ -381,8 +394,8 @@ def stream_audio(video_id: str):
     prune_cache(keep=mp3)
     # No filename= so it plays inline in <audio> instead of being sent as a download.
     return FileResponse(mp3, media_type="audio/mpeg")
-
-
+ 
+ 
 @app.get("/health")
 def health():
     """Quick environment check: open http://127.0.0.1:8000/health"""
@@ -405,8 +418,8 @@ def health():
             "max_mb": CACHE_MAX_MB,
         },
     }
-
-
+ 
+ 
 # --------------------------------------------------------------------------- #
 # Minimal web player
 # --------------------------------------------------------------------------- #
@@ -456,8 +469,9 @@ async function search(){const q=$('q').value.trim();if(!q)return;$('results').in
  <button onclick="addUrl('${s.url}')">Add</button></li>`).join('')}
 $('pl').onchange=loadQueue; loadPls();
 </script></body></html>"""
-
-
+ 
+ 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def player():
     return PLAYER_HTML
+ 
