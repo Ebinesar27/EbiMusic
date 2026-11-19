@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+audio_cache/
+music.db
+.git/
+README.md
